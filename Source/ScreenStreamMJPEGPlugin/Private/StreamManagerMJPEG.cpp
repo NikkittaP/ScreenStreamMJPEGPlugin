@@ -209,5 +209,11 @@ void AStreamManagerMJPEG::CaptureNonBlocking()
 
 void AStreamManagerMJPEG::UpdateRenderTargetAfterFrameSizeChanged()
 {
+    if (!IsValid(CaptureComponent))
+    {
+        UE_LOG(LogTemp, Error, TEXT("UpdateRenderTargetAfterFrameSizeChanged: CaptureComponent is not valid!"));
+        return;
+    }
+
     CaptureComponent->GetCaptureComponent2D()->TextureTarget->InitCustomFormat(FrameWidth, FrameHeight, PF_B8G8R8A8, true); // PF... disables HDR, which is most important since HDR gives gigantic overhead, and is not needed!
 }

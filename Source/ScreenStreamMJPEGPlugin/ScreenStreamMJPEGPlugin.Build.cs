@@ -6,9 +6,9 @@ public class ScreenStreamMJPEGPlugin : ModuleRules
 {
 	public ScreenStreamMJPEGPlugin(ReadOnlyTargetRules Target) : base(Target)
 	{
-		CppStandard = CppStandardVersion.Cpp17;
-		bEnableUndefinedIdentifierWarnings = false;
-
+		// C++ Standard: Use C++20 (required for UE 5.5+, compatible with 5.2-5.4)
+		CppStandard = CppStandardVersion.Cpp20;
+		
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 
 		PublicIncludePaths.AddRange(
