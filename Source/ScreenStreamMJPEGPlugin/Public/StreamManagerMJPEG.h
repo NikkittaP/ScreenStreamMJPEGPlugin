@@ -10,6 +10,8 @@ class UMaterial;
 #include "Containers/Queue.h"
 #include "Async/AsyncWork.h"
 
+DECLARE_LOG_CATEGORY_EXTERN(LogStreamMJPEG, Log, All);
+
 #include "mjpeg_streamer.hpp"
 
 #include "StreamManagerMJPEG.generated.h"
@@ -58,6 +60,9 @@ protected:
 
     // RenderRequest Queue
     TQueue<FRenderRequestStreamMJPEGStruct*> RenderRequestQueue;
+    
+    // Queue size tracker (TQueue doesn't expose size)
+    std::atomic<int32> QueueSize{0};
 
     int ImgCounter = 0;
 

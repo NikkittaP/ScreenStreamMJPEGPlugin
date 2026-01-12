@@ -2,6 +2,8 @@
 
 #include "StreamManagerMJPEG.h"
 
+DEFINE_LOG_CATEGORY(LogStreamMJPEG);
+
 // #include "Engine.h"
 #include "Runtime/Engine/Classes/Engine/Engine.h"
 
@@ -48,7 +50,7 @@ void AStreamManagerMJPEG::BeginPlay()
     }
     else
     {
-        UE_LOG(LogTemp, Error, TEXT("No CaptureComponent set!"));
+        UE_LOG(LogStreamMJPEG, Error, TEXT("No CaptureComponent set!"));
     }
 }
 
@@ -62,6 +64,28 @@ void AStreamManagerMJPEG::EndPlay(const EEndPlayReason::Type EndPlayReason)
 void AStreamManagerMJPEG::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
+
+    // Check for queue overflow (memory leak detection)
+    int32 CurrentQueueSize = QueueSize.load();
+    
+    if (CurrentQueueSize > 10)
+    {
+        UE_LOG(LogStreamMJPEG, Error, TEXT("StreamManagerMJPEG: RenderRequestQueue overflow! Size: %d. Memory leak detected!"), CurrentQueueSize);
+        
+        // Emergency cleanup: drain queue to prevent OOM
+        while (!RenderRequestQueue.IsEmpty())
+        {
+            FRenderRequestStreamMJPEGStruct* Request = nullptr;
+            RenderRequestQueue.Dequeue(Request);
+            if (Request)
+            {
+                delete Request;
+                QueueSize--;
+            }
+        }
+        UE_LOG(LogStreamMJPEG, Warning, TEXT("StreamManagerMJPEG: Emergency queue cleanup performed"));
+        return;
+    }
 
     if (!RenderRequestQueue.IsEmpty())
     {
@@ -92,6 +116,7 @@ void AStreamManagerMJPEG::Tick(float DeltaTime)
 
                 // Delete the first element from RenderQueue
                 RenderRequestQueue.Pop();
+                QueueSize--;
                 delete nextRenderRequest;
             }
         }
@@ -102,7 +127,7 @@ void AStreamManagerMJPEG::SetupCaptureComponent()
 {
     if (!IsValid(CaptureComponent))
     {
-        UE_LOG(LogTemp, Error, TEXT("SetupCaptureComponent: CaptureComponent is not valid!"));
+        UE_LOG(LogStreamMJPEG, Error, TEXT("SetupCaptureComponent: CaptureComponent is not valid!"));
         return;
     }
 
@@ -112,7 +137,7 @@ void AStreamManagerMJPEG::SetupCaptureComponent()
     // Color Capture
     renderTarget2D->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;   // 8-bit color format
     renderTarget2D->InitCustomFormat(FrameWidth, FrameHeight, PF_B8G8R8A8, true); // PF... disables HDR, which is most important since HDR gives gigantic overhead, and is not needed!
-    UE_LOG(LogTemp, Warning, TEXT("Set Render Format for Color-Like-Captures"));
+    UE_LOG(LogStreamMJPEG, Warning, TEXT("Set Render Format for Color-Like-Captures"));
 
     renderTarget2D->bGPUSharedFlag = true; // demand buffer on GPU
 
@@ -124,19 +149,33 @@ void AStreamManagerMJPEG::SetupCaptureComponent()
     CaptureComponent->GetCaptureComponent2D()->ShowFlags.SetTemporalAA(true);
     // lookup more showflags in the UE4 documentation..
 
-    UE_LOG(LogTemp, Warning, TEXT("Initialized RenderTarget!"));
+    UE_LOG(LogStreamMJPEG, Warning, TEXT("Initialized RenderTarget!"));
 }
 
 void AStreamManagerMJPEG::CaptureNonBlocking()
 {
     if (!IsValid(CaptureComponent))
     {
-        UE_LOG(LogTemp, Error, TEXT("CaptureColorNonBlocking: CaptureComponent was not valid!"));
+        UE_LOG(LogStreamMJPEG, Error, TEXT("CaptureColorNonBlocking: CaptureComponent was not valid!"));
         return;
     }
+    
+    // Prevent queue overflow - skip capture if queue is too large
+    int32 CurrentQueueSize = QueueSize.load();
+    if (CurrentQueueSize > 5)
+    {
+        static int32 SkipCount = 0;
+        SkipCount++;
+        if (SkipCount % 100 == 1) // Log every 100 skips
+        {
+            UE_LOG(LogStreamMJPEG, Warning, TEXT("CaptureNonBlocking: Skipping capture, queue size: %d (skipped %d times)"), CurrentQueueSize, SkipCount);
+        }
+        return;
+    }
+    
     if (VerboseLogging)
     {
-        UE_LOG(LogTemp, Warning, TEXT("Entering: CaptureNonBlocking"));
+        UE_LOG(LogStreamMJPEG, Warning, TEXT("Entering: CaptureNonBlocking"));
     }
     CaptureComponent->GetCaptureComponent2D()->TextureTarget->TargetGamma = GEngine->GetDisplayGamma();
 
@@ -144,7 +183,7 @@ void AStreamManagerMJPEG::CaptureNonBlocking()
     FTextureRenderTargetResource *renderTargetResource = CaptureComponent->GetCaptureComponent2D()->TextureTarget->GameThread_GetRenderTargetResource();
     if (VerboseLogging)
     {
-        UE_LOG(LogTemp, Warning, TEXT("Got display gamma"));
+        UE_LOG(LogStreamMJPEG, Warning, TEXT("Got display gamma"));
     }
     struct FReadSurfaceContext
     {
@@ -155,13 +194,13 @@ void AStreamManagerMJPEG::CaptureNonBlocking()
     };
     if (VerboseLogging)
     {
-        UE_LOG(LogTemp, Warning, TEXT("Inited ReadSurfaceContext"));
+        UE_LOG(LogStreamMJPEG, Warning, TEXT("Inited ReadSurfaceContext"));
     }
     // Init new RenderRequest
     FRenderRequestStreamMJPEGStruct *renderRequest = new FRenderRequestStreamMJPEGStruct();
     if (VerboseLogging)
     {
-        UE_LOG(LogTemp, Warning, TEXT("inited renderrequest"));
+        UE_LOG(LogStreamMJPEG, Warning, TEXT("inited renderrequest"));
     }
 
     // Setup GPU command
@@ -172,7 +211,7 @@ void AStreamManagerMJPEG::CaptureNonBlocking()
         FReadSurfaceDataFlags(RCM_UNorm, CubeFace_MAX)};
     if (VerboseLogging)
     {
-        UE_LOG(LogTemp, Warning, TEXT("GPU Command complete"));
+        UE_LOG(LogStreamMJPEG, Warning, TEXT("GPU Command complete"));
     }
     // Send command to GPU
     /* Up to version 4.22 use this
@@ -202,6 +241,7 @@ void AStreamManagerMJPEG::CaptureNonBlocking()
 
     // Notifiy new task in RenderQueue
     RenderRequestQueue.Enqueue(renderRequest);
+    QueueSize++;
 
     // Set RenderCommandFence
     renderRequest->RenderFence.BeginFence();
@@ -211,7 +251,7 @@ void AStreamManagerMJPEG::UpdateRenderTargetAfterFrameSizeChanged()
 {
     if (!IsValid(CaptureComponent))
     {
-        UE_LOG(LogTemp, Error, TEXT("UpdateRenderTargetAfterFrameSizeChanged: CaptureComponent is not valid!"));
+        UE_LOG(LogStreamMJPEG, Error, TEXT("UpdateRenderTargetAfterFrameSizeChanged: CaptureComponent is not valid!"));
         return;
     }
 
