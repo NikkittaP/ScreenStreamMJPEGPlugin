@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "1.0.0",
+	"VersionName": "1.0.1",
 	"FriendlyName": "ScreenStreamMJPEGPlugin",
 	"Description": "A plugin for capturing and streaming screen content as MJPEG over HTTP.",
 	"Category": "Streaming",
@@ -10,7 +10,7 @@
 	"DocsURL": "",
 	"MarketplaceURL": "",
 	"SupportURL": "",
-	"EngineVersion": "5.2.0",
+	"EngineVersion": "5.7",
 	"CanContainContent": true,
 	"Installed": true,
 	"Modules": [
