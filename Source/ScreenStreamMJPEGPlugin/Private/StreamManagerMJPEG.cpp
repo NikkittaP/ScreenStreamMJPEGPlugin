@@ -1,6 +1,7 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
 #include "StreamManagerMJPEG.h"
+#include "MJPEGStreamerImpl.h"
 
 DEFINE_LOG_CATEGORY(LogStreamMJPEG);
 
@@ -27,14 +28,13 @@ DEFINE_LOG_CATEGORY(LogStreamMJPEG);
 
 #include "Modules/ModuleManager.h"
 
-#include "mjpeg_streamer.hpp"
-
-using MJPEGStreamer = nadjieb::MJPEGStreamer;
-
 AStreamManagerMJPEG::AStreamManagerMJPEG()
 {
     // Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
     PrimaryActorTick.bCanEverTick = true;
+    
+    // Initialize Pimpl
+    StreamerImpl = MakeUnique<FMJPEGStreamerImpl>();
 }
 
 // Called when the game starts or when spawned
@@ -46,7 +46,7 @@ void AStreamManagerMJPEG::BeginPlay()
     {
         SetupCaptureComponent();
 
-        streamer.start(ServerPort);
+        StreamerImpl->Start(ServerPort);
     }
     else
     {
@@ -56,7 +56,7 @@ void AStreamManagerMJPEG::BeginPlay()
 
 void AStreamManagerMJPEG::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-    streamer.stop();
+    StreamerImpl->Stop();
     Super::EndPlay(EndPlayReason);
 }
 
@@ -110,7 +110,7 @@ void AStreamManagerMJPEG::Tick(float DeltaTime)
                 std::vector<uint8_t> vectorBuffer(ImgData.GetData(), ImgData.GetData() + ImgData.Num());
 
                 // Construct std::string from std::vector<uint8_t>
-                streamer.publish("/stream.mjpg", std::string(vectorBuffer.begin(), vectorBuffer.end()));
+                StreamerImpl->Publish("/stream.mjpg", std::string(vectorBuffer.begin(), vectorBuffer.end()));
 
                 ImgCounter += 1;
 

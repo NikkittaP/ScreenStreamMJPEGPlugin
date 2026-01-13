@@ -4,6 +4,7 @@
 
 class ASceneCapture2D;
 class UMaterial;
+class FMJPEGStreamerImpl;
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
@@ -11,8 +12,6 @@ class UMaterial;
 #include "Async/AsyncWork.h"
 
 DECLARE_LOG_CATEGORY_EXTERN(LogStreamMJPEG, Log, All);
-
-#include "mjpeg_streamer.hpp"
 
 #include "StreamManagerMJPEG.generated.h"
 
@@ -56,7 +55,8 @@ public:
     void UpdateRenderTargetAfterFrameSizeChanged();
 
 protected:
-    nadjieb::MJPEGStreamer streamer;
+    // Pimpl to hide MJPEG streamer implementation details
+    TUniquePtr<FMJPEGStreamerImpl> StreamerImpl;
 
     // RenderRequest Queue
     TQueue<FRenderRequestStreamMJPEGStruct*> RenderRequestQueue;
