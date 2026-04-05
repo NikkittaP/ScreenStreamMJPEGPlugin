@@ -28,6 +28,9 @@ DEFINE_LOG_CATEGORY(LogStreamMJPEG);
 
 #include "Modules/ModuleManager.h"
 
+#include "Slate/WidgetRenderer.h"
+#include "Blueprint/UserWidget.h"
+
 AStreamManagerMJPEG::AStreamManagerMJPEG()
 {
     // Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
@@ -56,6 +59,31 @@ void AStreamManagerMJPEG::BeginPlay()
 
 void AStreamManagerMJPEG::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    // Drain render request queue to prevent memory leaks
+    int32 DrainedCount = 0;
+    while (!RenderRequestQueue.IsEmpty())
+    {
+        FRenderRequestStreamMJPEGStruct* Request = nullptr;
+        RenderRequestQueue.Dequeue(Request);
+        if (Request)
+        {
+            Request->RenderFence.Wait();
+            delete Request;
+            QueueSize--;
+            DrainedCount++;
+        }
+    }
+    if (DrainedCount > 0)
+    {
+        UE_LOG(LogStreamMJPEG, Verbose, TEXT("EndPlay: Drained %d pending render requests"), DrainedCount);
+    }
+
+    // Release reusable resources
+    ImageWrapper.Reset();
+    CachedOverlayPixels.Empty();
+    WidgetRenderer.Reset();
+    OverlaySlateWidget.Reset();
+
     StreamerImpl->Stop();
     Super::EndPlay(EndPlayReason);
 }
@@ -83,42 +111,121 @@ void AStreamManagerMJPEG::Tick(float DeltaTime)
                 QueueSize--;
             }
         }
-        UE_LOG(LogStreamMJPEG, Warning, TEXT("StreamManagerMJPEG: Emergency queue cleanup performed"));
+        UE_LOG(LogStreamMJPEG, Verbose, TEXT("StreamManagerMJPEG: Emergency queue cleanup performed"));
         return;
     }
 
     if (!RenderRequestQueue.IsEmpty())
     {
-        // Peek the next RenderRequest from queue
-        FRenderRequestStreamMJPEGStruct *nextRenderRequest = nullptr;
-        RenderRequestQueue.Peek(nextRenderRequest);
+        // ── Drain all completed requests, keep only the newest ──────────────
+        // This prevents queue backup: during hitches multiple frames pile up.
+        // We skip stale frames (just free them) and only JPEG-encode the latest.
+        FRenderRequestStreamMJPEGStruct* latestReady = nullptr;
+        int32 SkippedStale = 0;
 
-        if (nextRenderRequest)
-        { // nullptr check
-            if (nextRenderRequest->RenderFence.IsFenceComplete())
+        while (!RenderRequestQueue.IsEmpty())
+        {
+            FRenderRequestStreamMJPEGStruct* candidate = nullptr;
+            RenderRequestQueue.Peek(candidate);
+            if (!candidate) break;
+
+            if (!candidate->RenderFence.IsFenceComplete())
+                break;  // this and all subsequent are still GPU-pending
+
+            // Dequeue this completed request
+            RenderRequestQueue.Pop();
+            QueueSize--;
+
+            // If we already have a newer ready frame, discard the older one
+            if (latestReady)
             {
-                // Check if rendering is done, indicated by RenderFence
-                // Load the image wrapper module
-                IImageWrapperModule &ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
-
-                // Prepare data to be JPEG
-                static TSharedPtr<IImageWrapper> imageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::JPEG); // EImageFormat::JPEG
-                imageWrapper->SetRaw(nextRenderRequest->Image.GetData(), nextRenderRequest->Image.GetAllocatedSize(), FrameWidth, FrameHeight, ERGBFormat::BGRA, 8);
-                const TArray64<uint8> &ImgData = imageWrapper->GetCompressed(0);
-
-                // Copy TArray64<uint8> to std::vector<uint8_t>
-                std::vector<uint8_t> vectorBuffer(ImgData.GetData(), ImgData.GetData() + ImgData.Num());
-
-                // Construct std::string from std::vector<uint8_t>
-                StreamerImpl->Publish("/stream.mjpg", std::string(vectorBuffer.begin(), vectorBuffer.end()));
-
-                ImgCounter += 1;
-
-                // Delete the first element from RenderQueue
-                RenderRequestQueue.Pop();
-                QueueSize--;
-                delete nextRenderRequest;
+                delete latestReady;
+                SkippedStale++;
             }
+            latestReady = candidate;
+        }
+
+        if (SkippedStale > 0)
+        {
+            UE_LOG(LogStreamMJPEG, Verbose, TEXT("Tick: Skipped %d stale frames, queue=%d"), SkippedStale, QueueSize.load());
+        }
+
+        if (latestReady)
+        {
+            double TickStartTime = FPlatformTime::Seconds();
+
+            // ── Alpha-composite overlay onto scene image ────────────────
+            if (latestReady->bHasOverlay &&
+                latestReady->OverlayImage.Num() == latestReady->Image.Num())
+            {
+                // Cache overlay pixels only when throttling (interval > 1)
+                if (OverlayRefreshInterval > 1 &&
+                    latestReady->OverlayImage.GetData() != CachedOverlayPixels.GetData())
+                {
+                    CachedOverlayPixels = latestReady->OverlayImage;
+                }
+
+                const int32 PixelCount = latestReady->Image.Num();
+                FColor* SceneData = latestReady->Image.GetData();
+                const FColor* OverlayData = latestReady->OverlayImage.GetData();
+
+                for (int32 i = 0; i < PixelCount; ++i)
+                {
+                    const uint8 A = OverlayData[i].A;
+                    if (A == 0) continue;
+                    if (A == 255)
+                    {
+                        SceneData[i] = OverlayData[i];
+                    }
+                    else
+                    {
+                        const uint32 InvA = 255 - A;
+                        SceneData[i].R = (uint8)((OverlayData[i].R * A + SceneData[i].R * InvA + 127) / 255);
+                        SceneData[i].G = (uint8)((OverlayData[i].G * A + SceneData[i].G * InvA + 127) / 255);
+                        SceneData[i].B = (uint8)((OverlayData[i].B * A + SceneData[i].B * InvA + 127) / 255);
+                        SceneData[i].A = 255;
+                    }
+                }
+            }
+
+            double AfterComposite = FPlatformTime::Seconds();
+
+            // Lazy-init the reusable image wrapper
+            if (!ImageWrapper)
+            {
+                IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+                ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::JPEG);
+            }
+
+            // JPEG encode
+            ImageWrapper->SetRaw(latestReady->Image.GetData(), latestReady->Image.GetAllocatedSize(), FrameWidth, FrameHeight, ERGBFormat::BGRA, 8);
+            const TArray64<uint8>& ImgData = ImageWrapper->GetCompressed(0);
+
+            double AfterJpeg = FPlatformTime::Seconds();
+
+            // Publish JPEG data — reuse std::string to avoid per-frame alloc
+            StreamerImpl->Publish("/stream.mjpg", std::string(reinterpret_cast<const char*>(ImgData.GetData()), ImgData.Num()));
+
+            double AfterPublish = FPlatformTime::Seconds();
+
+            ImgCounter += 1;
+
+            // Log timing every 100 frames
+            if (ImgCounter % 100 == 0)
+            {
+                double CompMs = (AfterComposite - TickStartTime) * 1000.0;
+                double JpegMs = (AfterJpeg - AfterComposite) * 1000.0;
+                double PublishMs = (AfterPublish - AfterJpeg) * 1000.0;
+                double TotalMs = (AfterPublish - TickStartTime) * 1000.0;
+                UE_LOG(LogStreamMJPEG, Verbose, TEXT("Frame %d | Queue=%d | Composite=%.1fms JPEG=%.1fms Publish=%.1fms Total=%.1fms | Scene=%d Overlay=%d pixels | JPEG=%lldB"),
+                    ImgCounter, QueueSize.load(),
+                    CompMs, JpegMs, PublishMs, TotalMs,
+                    latestReady->Image.Num(),
+                    latestReady->OverlayImage.Num(),
+                    ImgData.Num());
+            }
+
+            delete latestReady;
         }
     }
 }
@@ -132,12 +239,12 @@ void AStreamManagerMJPEG::SetupCaptureComponent()
     }
 
     // Create RenderTargets
-    UTextureRenderTarget2D *renderTarget2D = NewObject<UTextureRenderTarget2D>();
+    UTextureRenderTarget2D *renderTarget2D = NewObject<UTextureRenderTarget2D>(this);
 
     // Color Capture
     renderTarget2D->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;   // 8-bit color format
     renderTarget2D->InitCustomFormat(FrameWidth, FrameHeight, PF_B8G8R8A8, true); // PF... disables HDR, which is most important since HDR gives gigantic overhead, and is not needed!
-    UE_LOG(LogStreamMJPEG, Warning, TEXT("Set Render Format for Color-Like-Captures"));
+    UE_LOG(LogStreamMJPEG, Verbose, TEXT("Set Render Format for Color-Like-Captures"));
 
     renderTarget2D->bGPUSharedFlag = true; // demand buffer on GPU
 
@@ -149,7 +256,7 @@ void AStreamManagerMJPEG::SetupCaptureComponent()
     CaptureComponent->GetCaptureComponent2D()->ShowFlags.SetTemporalAA(true);
     // lookup more showflags in the UE4 documentation..
 
-    UE_LOG(LogStreamMJPEG, Warning, TEXT("Initialized RenderTarget!"));
+    UE_LOG(LogStreamMJPEG, Verbose, TEXT("Initialized RenderTarget!"));
 }
 
 void AStreamManagerMJPEG::CaptureNonBlocking()
@@ -164,18 +271,13 @@ void AStreamManagerMJPEG::CaptureNonBlocking()
     int32 CurrentQueueSize = QueueSize.load();
     if (CurrentQueueSize > 5)
     {
-        static int32 SkipCount = 0;
-        SkipCount++;
-        if (SkipCount % 100 == 1) // Log every 100 skips
-        {
-            UE_LOG(LogStreamMJPEG, Warning, TEXT("CaptureNonBlocking: Skipping capture, queue size: %d (skipped %d times)"), CurrentQueueSize, SkipCount);
-        }
+        UE_LOG(LogStreamMJPEG, Verbose, TEXT("CaptureNonBlocking: Skipping capture, queue size: %d"), CurrentQueueSize);
         return;
     }
     
     if (VerboseLogging)
     {
-        UE_LOG(LogStreamMJPEG, Warning, TEXT("Entering: CaptureNonBlocking"));
+        UE_LOG(LogStreamMJPEG, Verbose, TEXT("Entering: CaptureNonBlocking"));
     }
     CaptureComponent->GetCaptureComponent2D()->TextureTarget->TargetGamma = GEngine->GetDisplayGamma();
 
@@ -183,7 +285,7 @@ void AStreamManagerMJPEG::CaptureNonBlocking()
     FTextureRenderTargetResource *renderTargetResource = CaptureComponent->GetCaptureComponent2D()->TextureTarget->GameThread_GetRenderTargetResource();
     if (VerboseLogging)
     {
-        UE_LOG(LogStreamMJPEG, Warning, TEXT("Got display gamma"));
+        UE_LOG(LogStreamMJPEG, Verbose, TEXT("Got display gamma"));
     }
     struct FReadSurfaceContext
     {
@@ -194,13 +296,51 @@ void AStreamManagerMJPEG::CaptureNonBlocking()
     };
     if (VerboseLogging)
     {
-        UE_LOG(LogStreamMJPEG, Warning, TEXT("Inited ReadSurfaceContext"));
+        UE_LOG(LogStreamMJPEG, Verbose, TEXT("Inited ReadSurfaceContext"));
     }
     // Init new RenderRequest
     FRenderRequestStreamMJPEGStruct *renderRequest = new FRenderRequestStreamMJPEGStruct();
     if (VerboseLogging)
     {
-        UE_LOG(LogStreamMJPEG, Warning, TEXT("inited renderrequest"));
+        UE_LOG(LogStreamMJPEG, Verbose, TEXT("inited renderrequest"));
+    }
+
+    // ── Render overlay widget every frame, but throttle GPU readback ──────
+    // DrawWidget is cheap (~0.5ms) so we always re-render to keep label
+    // positions current. The expensive GPU ReadSurfaceData is throttled.
+    bool bFreshOverlayRender = false;
+    if (OverlaySlateWidget.IsValid() && WidgetRenderer.IsValid() && OverlayRenderTarget)
+    {
+        FTextureRenderTargetResource* OverlayResource = OverlayRenderTarget->GameThread_GetRenderTargetResource();
+        if (OverlayResource)
+        {
+            double DrawStart = FPlatformTime::Seconds();
+            WidgetRenderer->DrawWidget(OverlayResource, OverlaySlateWidget.ToSharedRef(),
+                FVector2D(FrameWidth, FrameHeight), GetWorld()->GetDeltaSeconds());
+            double DrawEnd = FPlatformTime::Seconds();
+
+            OverlayDrawCount++;
+            if (OverlayDrawCount % 100 == 0)
+            {
+                UE_LOG(LogStreamMJPEG, Verbose, TEXT("DrawWidget took %.1fms (call #%d, queue=%d)"),
+                    (DrawEnd - DrawStart) * 1000.0, OverlayDrawCount, CurrentQueueSize);
+            }
+
+            // Decide whether to do a GPU readback this frame
+            OverlayFrameCounter++;
+            if (OverlayFrameCounter >= OverlayRefreshInterval)
+            {
+                OverlayFrameCounter = 0;
+                bFreshOverlayRender = true;
+                renderRequest->bHasOverlay = true;
+            }
+            else if (CachedOverlayPixels.Num() > 0)
+            {
+                // Use cached pixels from last GPU readback
+                renderRequest->OverlayImage = CachedOverlayPixels;
+                renderRequest->bHasOverlay = true;
+            }
+        }
     }
 
     // Setup GPU command
@@ -211,23 +351,10 @@ void AStreamManagerMJPEG::CaptureNonBlocking()
         FReadSurfaceDataFlags(RCM_UNorm, CubeFace_MAX)};
     if (VerboseLogging)
     {
-        UE_LOG(LogStreamMJPEG, Warning, TEXT("GPU Command complete"));
+        UE_LOG(LogStreamMJPEG, Verbose, TEXT("GPU Command complete"));
     }
-    // Send command to GPU
-    /* Up to version 4.22 use this
-    ENQUEUE_UNIQUE_RENDER_COMMAND_ONEPARAMETER(
-        SceneDrawCompletion,//ReadSurfaceCommand,
-        FReadSurfaceContext, Context, readSurfaceContext,
-    {
-        RHICmdList.ReadSurfaceData(
-            Context.SrcRenderTarget->GetRenderTargetTexture(),
-            Context.Rect,
-            *Context.OutData,
-            Context.Flags
-        );
-    });
-    */
-    // Above 4.22 use this
+
+    // ── Enqueue scene read ──────────────────────────────────────────────────
     ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)
     (
         [readSurfaceContext](FRHICommandListImmediate &RHICmdList)
@@ -238,6 +365,28 @@ void AStreamManagerMJPEG::CaptureNonBlocking()
                 *readSurfaceContext.OutData,
                 readSurfaceContext.Flags);
         });
+
+    // ── Enqueue overlay read (only on fresh renders, not cached frames) ───
+    if (bFreshOverlayRender)
+    {
+        FTextureRenderTargetResource* OverlayResource = OverlayRenderTarget->GameThread_GetRenderTargetResource();
+        FReadSurfaceContext overlayContext = {
+            OverlayResource,
+            &(renderRequest->OverlayImage),
+            FIntRect(0, 0, OverlayResource->GetSizeXY().X, OverlayResource->GetSizeXY().Y),
+            FReadSurfaceDataFlags(RCM_UNorm, CubeFace_MAX)};
+
+        ENQUEUE_RENDER_COMMAND(OverlayDrawCompletion)
+        (
+            [overlayContext](FRHICommandListImmediate &RHICmdList)
+            {
+                RHICmdList.ReadSurfaceData(
+                    overlayContext.SrcRenderTarget->GetRenderTargetTexture(),
+                    overlayContext.Rect,
+                    *overlayContext.OutData,
+                    overlayContext.Flags);
+            });
+    }
 
     // Notifiy new task in RenderQueue
     RenderRequestQueue.Enqueue(renderRequest);
@@ -256,4 +405,47 @@ void AStreamManagerMJPEG::UpdateRenderTargetAfterFrameSizeChanged()
     }
 
     CaptureComponent->GetCaptureComponent2D()->TextureTarget->InitCustomFormat(FrameWidth, FrameHeight, PF_B8G8R8A8, true); // PF... disables HDR, which is most important since HDR gives gigantic overhead, and is not needed!
+
+    // Re-create overlay render target if an overlay widget is active
+    if (OverlaySlateWidget.IsValid())
+    {
+        if (!OverlayRenderTarget)
+        {
+            OverlayRenderTarget = NewObject<UTextureRenderTarget2D>(this);
+        }
+        OverlayRenderTarget->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
+        OverlayRenderTarget->ClearColor = FLinearColor::Transparent;
+        OverlayRenderTarget->bGPUSharedFlag = true;
+        OverlayRenderTarget->InitCustomFormat(FrameWidth, FrameHeight, PF_B8G8R8A8, true);
+    }
+}
+
+void AStreamManagerMJPEG::SetOverlayWidget(UUserWidget* InWidget)
+{
+    if (InWidget)
+    {
+        OverlaySlateWidget = InWidget->TakeWidget();
+
+        if (!WidgetRenderer)
+        {
+            // bUseGammaCorrection = true
+            WidgetRenderer = MakeUnique<FWidgetRenderer>(/*bUseGammaCorrection=*/true);
+        }
+
+        if (!OverlayRenderTarget)
+        {
+            OverlayRenderTarget = NewObject<UTextureRenderTarget2D>(this);
+            OverlayRenderTarget->RenderTargetFormat = ETextureRenderTargetFormat::RTF_RGBA8;
+            OverlayRenderTarget->ClearColor = FLinearColor::Transparent;
+            OverlayRenderTarget->bGPUSharedFlag = true;
+            OverlayRenderTarget->InitCustomFormat(FrameWidth, FrameHeight, PF_B8G8R8A8, true);
+        }
+
+        UE_LOG(LogStreamMJPEG, Verbose, TEXT("Overlay widget set (%dx%d)"), FrameWidth, FrameHeight);
+    }
+    else
+    {
+        OverlaySlateWidget.Reset();
+        UE_LOG(LogStreamMJPEG, Verbose, TEXT("Overlay widget cleared"));
+    }
 }
