@@ -1,4 +1,5 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
+// Copyright (c) 2024 Nikita Petrov (https://github.com/NikkittaP)
+// SPDX-License-Identifier: MIT
 
 #include "MJPEGStreamerImpl.h"
 

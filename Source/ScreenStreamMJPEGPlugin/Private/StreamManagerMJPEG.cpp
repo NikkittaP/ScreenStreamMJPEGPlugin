@@ -1,4 +1,5 @@
-// Fill out your copyright notice in the Description page of Project Settings.
+// Copyright (c) 2024 Nikita Petrov (https://github.com/NikkittaP)
+// SPDX-License-Identifier: MIT
 
 #include "StreamManagerMJPEG.h"
 #include "MJPEGStreamerImpl.h"
